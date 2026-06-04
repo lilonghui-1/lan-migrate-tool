@@ -102,6 +102,11 @@ class DataScanner:
         if app_data.items:
             self.categories.append(app_data)
         
+        # 扫描C盘其他数据
+        c_drive_data = self.scan_c_drive_data()
+        if c_drive_data.items:
+            self.categories.append(c_drive_data)
+        
         # 扫描注册表
         registry_data = self.scan_registry()
         if registry_data.items:
@@ -237,6 +242,111 @@ class DataScanner:
                     description="本地应用数据"
                 )
                 category.items.append(item)
+        
+        return category
+    
+    def scan_c_drive_data(self) -> DataCategory:
+        """
+        扫描C盘其他数据
+        
+        Returns:
+            C盘数据分类
+        """
+        category = DataCategory(
+            name="c_drive_data",
+            display_name="C盘其他数据",
+            description="公共文件夹、程序数据等C盘上的其他数据"
+        )
+        
+        # 公共文件夹
+        public_path = os.environ.get("PUBLIC", "")
+        if public_path and os.path.exists(public_path):
+            # 公共文档
+            public_documents = os.path.join(public_path, "Documents")
+            if os.path.exists(public_documents):
+                size = get_folder_size(public_documents)
+                count = count_files(public_documents)
+                if size > 0:
+                    item = DataItem(
+                        name="PublicDocuments",
+                        path=public_documents,
+                        item_type="folder",
+                        size=size,
+                        count=count,
+                        description="公共文档"
+                    )
+                    category.items.append(item)
+            
+            # 公共桌面
+            public_desktop = os.path.join(public_path, "Desktop")
+            if os.path.exists(public_desktop):
+                size = get_folder_size(public_desktop)
+                count = count_files(public_desktop)
+                if size > 0:
+                    item = DataItem(
+                        name="PublicDesktop",
+                        path=public_desktop,
+                        item_type="folder",
+                        size=size,
+                        count=count,
+                        description="公共桌面"
+                    )
+                    category.items.append(item)
+            
+            # 公共下载
+            public_downloads = os.path.join(public_path, "Downloads")
+            if os.path.exists(public_downloads):
+                size = get_folder_size(public_downloads)
+                count = count_files(public_downloads)
+                if size > 0:
+                    item = DataItem(
+                        name="PublicDownloads",
+                        path=public_downloads,
+                        item_type="folder",
+                        size=size,
+                        count=count,
+                        description="公共下载"
+                    )
+                    category.items.append(item)
+        
+        # ProgramData 文件夹
+        program_data = os.environ.get("PROGRAMDATA", "")
+        if program_data and os.path.exists(program_data):
+            size = get_folder_size(program_data)
+            count = count_files(program_data)
+            if size > 0:
+                item = DataItem(
+                    name="ProgramData",
+                    path=program_data,
+                    item_type="folder",
+                    size=size,
+                    count=count,
+                    description="程序数据 (ProgramData)"
+                )
+                # 默认不选中，因为这通常包含系统程序数据
+                item.selected = False
+                category.items.append(item)
+        
+        # 直接扫描C盘根目录下的常见用户数据目录
+        c_drive = "C:\\"
+        
+        # OneDrive 目录（如果存在）
+        user_profile = os.environ.get("USERPROFILE", "")
+        if user_profile:
+            onedrive_path = os.path.join(user_profile, "OneDrive")
+            if os.path.exists(onedrive_path):
+                size = get_folder_size(onedrive_path)
+                count = count_files(onedrive_path)
+                if size > 0:
+                    item = DataItem(
+                        name="OneDrive",
+                        path=onedrive_path,
+                        item_type="folder",
+                        size=size,
+                        count=count,
+                        description="OneDrive 云存储"
+                    )
+                    category.items.append(item)
         
         return category
     

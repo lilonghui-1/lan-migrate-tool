@@ -15,13 +15,20 @@ from core.transfer import TransferManager
 from gui.device_page import DevicePage
 from gui.select_page import SelectPage
 from gui.transfer_page import TransferPage
+from gui.network_page import NetworkPage
 
 
 class MainWindow(QMainWindow):
     """应用程序主窗口"""
     
+    # 信号
+    transfer_completed = pyqtSignal(dict)  # 传输完成信号（用于线程安全更新）
+    
     def __init__(self):
         super().__init__()
+        
+        # 连接信号
+        self.transfer_completed.connect(self._on_transfer_complete_internal)
         
         # 初始化核心服务
         self.discovery = DiscoveryService()
@@ -93,6 +100,11 @@ class MainWindow(QMainWindow):
         nav_layout.addWidget(self.btn_transfer)
         self.nav_buttons.append(self.btn_transfer)
         
+        self.btn_network = self.create_nav_button("网络配置", False)
+        self.btn_network.clicked.connect(lambda: self.switch_page(3))
+        nav_layout.addWidget(self.btn_network)
+        self.nav_buttons.append(self.btn_network)
+        
         nav_layout.addStretch()
         
         # 帮助按钮
@@ -123,10 +135,13 @@ class MainWindow(QMainWindow):
         self.transfer_page.back_requested.connect(lambda: self.switch_page(1))
         self.transfer_page.cancel_requested.connect(self.on_transfer_cancelled)
         
+        self.network_page = NetworkPage()
+        
         # 添加页面到堆叠部件
         self.stack.addWidget(self.device_page)
         self.stack.addWidget(self.select_page)
         self.stack.addWidget(self.transfer_page)
+        self.stack.addWidget(self.network_page)
         
         main_layout.addWidget(self.stack)
         
@@ -277,14 +292,8 @@ class MainWindow(QMainWindow):
         """执行传输（在线程中）"""
         results = self.transfer_manager.transfer_items(items)
         
-        # 在主线程中更新UI
-        from PyQt6.QtCore import QMetaObject, Qt, Q_ARG
-        QMetaObject.invokeMethod(
-            self,
-            "_on_transfer_complete_internal",
-            Qt.ConnectionType.QueuedConnection,
-            Q_ARG(dict, results)
-        )
+        # 使用信号在主线程中更新UI
+        self.transfer_completed.emit(results)
     
     def _on_transfer_complete_internal(self, results: dict):
         """传输完成内部处理"""
@@ -292,13 +301,15 @@ class MainWindow(QMainWindow):
     
     def on_transfer_progress(self, data: dict):
         """传输进度更新"""
-        from PyQt6.QtCore import QMetaObject, Qt, Q_ARG
-        QMetaObject.invokeMethod(
-            self.transfer_page,
-            "update_progress",
-            Qt.ConnectionType.QueuedConnection,
-            Q_ARG(dict, data)
-        )
+        # 使用信号来安全地更新UI
+        self.transfer_page.progress_updated.emit(data)
+        
+        # 检查文件是否传输完成
+        if data.get("progress") == 100:
+            file_size = data.get("total", 0)
+            file_path = data.get("file_path", "")
+            # 使用信号来安全地更新UI
+            self.transfer_page.file_sent.emit(file_size, file_path)
     
     def on_transfer_complete(self):
         """传输完成回调"""
@@ -306,13 +317,8 @@ class MainWindow(QMainWindow):
     
     def on_transfer_error(self, error: str):
         """传输错误回调"""
-        from PyQt6.QtCore import QMetaObject, Qt, Q_ARG
-        QMetaObject.invokeMethod(
-            self.transfer_page,
-            "log",
-            Qt.ConnectionType.QueuedConnection,
-            Q_ARG(str, f"错误: {error}")
-        )
+        # 使用信号来安全地更新UI
+        self.transfer_page.log_message.emit(f"错误: {error}")
     
     def on_transfer_finished(self, results: dict):
         """传输完成处理"""

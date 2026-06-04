@@ -3,6 +3,7 @@
 管理 TCP 连接，执行文件发送/接收，支持断点续传
 """
 import os
+import socket
 import sqlite3
 import struct
 import threading
@@ -124,6 +125,15 @@ class TransferServer:
     def stop(self):
         """停止服务端"""
         self.running = False
+        
+        # 关闭所有已建立的连接
+        for handler in self.connections:
+            try:
+                handler.conn.close()
+            except Exception as e:
+                print(f"关闭连接失败: {e}")
+        self.connections.clear()
+        
         if self.socket:
             self.socket.close()
             self.socket = None
@@ -141,7 +151,7 @@ class TransferServer:
                 thread = threading.Thread(target=handler.handle, daemon=True)
                 thread.start()
                 self.connections.append(handler)
-            except sock.timeout:
+            except socket.timeout:
                 continue
             except Exception as e:
                 if self.running:
@@ -180,6 +190,14 @@ class ConnectionHandler:
     def handle(self):
         """处理连接"""
         try:
+            # 通知有客户端连接
+            if self.on_progress:
+                self.on_progress({
+                    "status": "connected",
+                    "client": f"{self.addr[0]}:{self.addr[1]}",
+                    "message": "客户端已连接，准备接收数据..."
+                })
+            
             self.conn.settimeout(config.SOCKET_TIMEOUT)
             
             while True:
@@ -219,10 +237,12 @@ class ConnectionHandler:
         """处理命令"""
         if cmd == Command.HELLO:
             # 握手响应
+            print(f"服务端: 收到 HELLO 消息，来自 {self.addr}")
             response = pack_message(Command.HELLO, create_hello_payload(
                 "接收端", config.VERSION
             ))
             self.conn.sendall(response)
+            print(f"服务端: 已发送 HELLO 响应")
         
         elif cmd == Command.SCAN_REQUEST:
             # 处理扫描请求
@@ -262,6 +282,15 @@ class ConnectionHandler:
             # 取消传输
             self._cleanup_current_file()
         
+        elif cmd == Command.PING:
+            # 心跳包，返回 PONG
+            pong = pack_message(Command.PONG, {"timestamp": payload.get("timestamp", 0)})
+            self.conn.sendall(pong)
+        
+        elif cmd == Command.PONG:
+            # 收到 PONG 响应（服务端一般不会收到 PONG）
+            pass
+        
         elif cmd == Command.ERROR:
             # 错误
             if self.on_error:
@@ -271,9 +300,13 @@ class ConnectionHandler:
         """处理文件头部"""
         relative_path = payload.get("relative_path", "")
         file_size = payload.get("file_size", 0)
+        original_path = payload.get("file_path", "")
         
-        # 构建接收路径
-        if relative_path:
+        # 使用原路径存储
+        if original_path:
+            self.current_file_path = original_path
+        elif relative_path:
+            # 兼容旧版本：使用相对路径
             self.current_file_path = os.path.join(self.receive_dir, relative_path)
         else:
             self.current_file_path = os.path.join(
@@ -372,10 +405,21 @@ class TransferClient:
         self.state_db = TransferStateDB()
         self.buffer = b""
         
+        # 连接信息（用于重连）
+        self.target_ip = ""
+        self.target_port = 0
+        
         # 回调
         self.on_progress: Optional[Callable] = None
         self.on_complete: Optional[Callable] = None
         self.on_error: Optional[Callable] = None
+        
+        # 心跳相关
+        self.heartbeat_thread: Optional[threading.Thread] = None
+        self.heartbeat_running = False
+        self.last_ping_time = 0
+        self.ping_interval = 10  # 心跳间隔（秒）
+        self.ping_timeout = 30   # 心跳超时时间（秒）
     
     def connect(self, ip: str, port: int = config.DEFAULT_PORT) -> bool:
         """
@@ -390,10 +434,16 @@ class TransferClient:
         """
         import socket as sock
         
+        # 保存连接信息用于重连
+        self.target_ip = ip
+        self.target_port = port
+        
         try:
             self.socket = sock.socket(sock.AF_INET, sock.SOCK_STREAM)
             self.socket.settimeout(config.SOCKET_TIMEOUT)
+            print(f"客户端: 尝试连接到 {ip}:{port}")
             self.socket.connect((ip, port))
+            print(f"客户端: TCP连接成功")
             self.connected = True
             
             # 发送握手
@@ -401,21 +451,150 @@ class TransferClient:
                 "发送端", config.VERSION
             ))
             self.socket.sendall(hello)
+            print(f"客户端: 已发送 HELLO 消息")
             
             # 等待响应
             response = self._wait_response(Command.HELLO)
-            return response is not None
+            if response is not None:
+                print(f"客户端: 收到 HELLO 响应")
+                # 启动心跳线程
+                self.start_heartbeat()
+                return True
+            print("连接失败: 未收到握手响应")
+            return False
         
+        except sock.timeout:
+            print("连接失败: 连接超时")
+            return False
+        except ConnectionRefusedError:
+            print("连接失败: 连接被拒绝，请确保目标设备上的服务已启动")
+            return False
         except Exception as e:
             print(f"连接失败: {e}")
             return False
     
+    def reconnect(self, max_retries: int = 3, retry_delay: int = 5) -> bool:
+        """
+        重新连接到目标设备
+        
+        Args:
+            max_retries: 最大重试次数
+            retry_delay: 重试间隔（秒）
+        
+        Returns:
+            是否重连成功
+        """
+        if not self.target_ip:
+            print("无法重连: 未保存目标地址")
+            return False
+        
+        print(f"客户端: 尝试重连到 {self.target_ip}:{self.target_port}")
+        
+        for attempt in range(max_retries):
+            # 先断开现有连接
+            if self.socket:
+                try:
+                    self.socket.close()
+                except Exception:
+                    pass
+                self.socket = None
+            
+            # 等待重试
+            if attempt > 0:
+                time.sleep(retry_delay)
+            
+            try:
+                import socket as sock
+                self.socket = sock.socket(sock.AF_INET, sock.SOCK_STREAM)
+                self.socket.settimeout(config.SOCKET_TIMEOUT)
+                self.socket.connect((self.target_ip, self.target_port))
+                self.connected = True
+                
+                # 发送握手
+                hello = pack_message(Command.HELLO, create_hello_payload(
+                    "发送端", config.VERSION
+                ))
+                self.socket.sendall(hello)
+                
+                response = self._wait_response(Command.HELLO)
+                if response is not None:
+                    print(f"客户端: 重连成功 (尝试 {attempt + 1})")
+                    # 重启心跳线程
+                    self.start_heartbeat()
+                    return True
+            except Exception as e:
+                print(f"客户端: 重连失败 (尝试 {attempt + 1}): {e}")
+        
+        print(f"客户端: 重连失败，已尝试 {max_retries} 次")
+        return False
+    
     def disconnect(self):
         """断开连接"""
+        self.stop_heartbeat()
         if self.socket:
             self.socket.close()
             self.socket = None
         self.connected = False
+    
+    def start_heartbeat(self):
+        """启动心跳线程"""
+        self.heartbeat_running = True
+        self.last_ping_time = time.time()
+        self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self.heartbeat_thread.start()
+        print("客户端: 心跳线程已启动")
+    
+    def stop_heartbeat(self):
+        """停止心跳线程"""
+        self.heartbeat_running = False
+        if self.heartbeat_thread:
+            self.heartbeat_thread.join(timeout=2)
+            self.heartbeat_thread = None
+        print("客户端: 心跳线程已停止")
+    
+    def _heartbeat_loop(self):
+        """心跳循环"""
+        while self.heartbeat_running:
+            try:
+                current_time = time.time()
+                
+                # 检查是否需要发送心跳
+                if current_time - self.last_ping_time >= self.ping_interval:
+                    self._send_ping()
+                    self.last_ping_time = current_time
+                
+                # 检查心跳超时
+                if current_time - self.last_ping_time >= self.ping_timeout:
+                    print("客户端: 心跳超时，连接已断开")
+                    if self.on_error:
+                        self.on_error("连接超时: 心跳无响应")
+                    self.connected = False
+                    break
+                
+                time.sleep(1)
+            
+            except ConnectionAbortedError:
+                print("连接被本地软件断开，重连")
+                if self.on_error:
+                    self.on_error("连接被本地软件断开")
+                self.connected = False
+                break
+            except Exception as e:
+                print(f"心跳线程异常: {e}")
+                if self.on_error:
+                    self.on_error(f"心跳异常: {str(e)}")
+                break
+    
+    def _send_ping(self):
+        """发送心跳包"""
+        if not self.connected or not self.socket:
+            return
+        
+        try:
+            ping_msg = pack_message(Command.PING, {"timestamp": time.time()})
+            self.socket.sendall(ping_msg)
+        except Exception as e:
+            print(f"发送心跳包失败: {e}")
     
     def request_scan(self) -> Optional[list]:
         """
@@ -510,6 +689,12 @@ class TransferClient:
             
             return False
         
+        except ConnectionAbortedError:
+            print("发送文件时连接被本地软件断开")
+            if self.on_error:
+                self.on_error("连接被本地软件断开，无法发送文件")
+            self.connected = False
+            return False
         except Exception as e:
             if self.on_error:
                 self.on_error(str(e))
@@ -608,6 +793,12 @@ class TransferClient:
             response = self._wait_response(Command.VERIFY_RESPONSE)
             return response is not None and response.get("verified", False)
         
+        except ConnectionAbortedError:
+            print("发送文件时连接被本地软件断开")
+            if self.on_error:
+                self.on_error("连接被本地软件断开，无法发送文件")
+            self.connected = False
+            return False
         except Exception as e:
             if self.on_error:
                 self.on_error(str(e))
@@ -615,9 +806,13 @@ class TransferClient:
     
     def send_complete(self):
         """发送传输完成通知"""
-        if self.connected:
-            msg = pack_message(Command.COMPLETE, {})
-            self.socket.sendall(msg)
+        if self.connected and self.socket:
+            try:
+                msg = pack_message(Command.COMPLETE, {})
+                self.socket.sendall(msg)
+                print("客户端: 已发送 COMPLETE 消息")
+            except Exception as e:
+                print(f"发送完成通知失败: {e}")
     
     def send_cancel(self):
         """发送取消通知"""
@@ -639,25 +834,39 @@ class TransferClient:
         start_time = time.time()
         
         while time.time() - start_time < timeout:
-            data = self.socket.recv(config.CHUNK_SIZE)
-            if not data:
-                break
-            
-            self.buffer += data
-            
-            while len(self.buffer) >= 8:
-                cmd, payload, remaining = unpack_message(self.buffer)
-                if cmd is None:
+            try:
+                data = self.socket.recv(config.CHUNK_SIZE)
+                if not data:
                     break
                 
-                self.buffer = remaining
+                self.buffer += data
                 
-                if cmd == expected_cmd:
-                    return payload
-                elif cmd == Command.ERROR:
-                    if self.on_error:
-                        self.on_error(payload.get("message", "未知错误"))
-                    return None
+                while len(self.buffer) >= 8:
+                    cmd, payload, remaining = unpack_message(self.buffer)
+                    if cmd is None:
+                        break
+                    
+                    self.buffer = remaining
+                    
+                    if cmd == Command.PONG:
+                        # 收到心跳响应，更新心跳时间
+                        self.last_ping_time = time.time()
+                        continue
+                    elif cmd == expected_cmd:
+                        return payload
+                    elif cmd == Command.ERROR:
+                        if self.on_error:
+                            self.on_error(payload.get("message", "未知错误"))
+                        return None
+            
+            except ConnectionAbortedError:
+                print("连接被本地软件断开")
+                if self.on_error:
+                    self.on_error("连接被本地软件断开")
+                return None
+            except Exception as e:
+                print(f"接收响应失败: {e}")
+                return None
         
         return None
 
@@ -716,8 +925,17 @@ class TransferManager:
         }
         
         # 发送传输开始
-        start_msg = pack_message(Command.TRANSFER_START, {"task_id": self.task_id})
-        self.client.socket.sendall(start_msg)
+        if not self.client.connected or not self.client.socket:
+            print("传输失败: 客户端未连接")
+            return results
+            
+        try:
+            start_msg = pack_message(Command.TRANSFER_START, {"task_id": self.task_id})
+            self.client.socket.sendall(start_msg)
+            print("客户端: 已发送 TRANSFER_START 消息")
+        except Exception as e:
+            print(f"发送传输开始消息失败: {e}")
+            return results
         
         for item in items:
             if self.cancelled:

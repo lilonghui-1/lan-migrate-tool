@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QPushButton, QLineEdit, QMessageBox
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QMetaObject, Q_ARG
 from PyQt6.QtGui import QFont
 
 from core.discovery import DiscoveryService, DeviceInfo
@@ -47,6 +47,7 @@ class DevicePage(QWidget):
     
     # 信号
     device_selected = pyqtSignal(DeviceInfo)  # 设备被选中
+    device_changed_signal = pyqtSignal(str, object)  # 设备变更信号
     
     def __init__(self, discovery: DiscoveryService, parent=None):
         super().__init__(parent)
@@ -174,6 +175,9 @@ class DevicePage(QWidget):
         self.device_list.itemSelectionChanged.connect(self.on_selection_changed)
         self.device_list.itemDoubleClicked.connect(self.on_item_double_clicked)
         
+        # 设备变更信号连接（用于线程安全的UI更新）
+        self.device_changed_signal.connect(self._handle_device_changed)
+        
         # 注册设备发现回调
         self.discovery.add_callback(self.on_device_changed)
     
@@ -198,7 +202,12 @@ class DevicePage(QWidget):
         self.device_list.setItemWidget(item, widget)
     
     def on_device_changed(self, event_type: str, device: DeviceInfo):
-        """设备变更回调"""
+        """设备变更回调（在发现线程中调用）"""
+        # 使用信号将 UI 更新切回主线程
+        self.device_changed_signal.emit(event_type, device)
+    
+    def _handle_device_changed(self, event_type: str, device: DeviceInfo):
+        """设备变更处理（在主线程中执行）"""
         if event_type == "added":
             # 检查是否已存在
             for i in range(self.device_list.count()):

@@ -19,6 +19,9 @@ class TransferPage(QWidget):
     transfer_finished = pyqtSignal(dict)  # 传输完成
     back_requested = pyqtSignal()  # 返回上一页
     cancel_requested = pyqtSignal()  # 取消传输
+    progress_updated = pyqtSignal(dict)  # 进度更新（用于线程安全更新）
+    file_sent = pyqtSignal(int, str)  # 文件发送完成（用于线程安全更新）
+    log_message = pyqtSignal(str)  # 日志消息（用于线程安全更新）
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -116,7 +119,6 @@ class TransferPage(QWidget):
         
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumBlockCount(500)  # 限制最大行数
         self.log_text.setStyleSheet("""
             QTextEdit {
                 border: 1px solid #ddd;
@@ -129,6 +131,7 @@ class TransferPage(QWidget):
             }
         """)
         log_layout.addWidget(self.log_text)
+        self.max_log_lines = 500
         
         layout.addWidget(log_group)
         
@@ -189,6 +192,9 @@ class TransferPage(QWidget):
         self.back_btn.clicked.connect(self.on_back)
         self.pause_btn.clicked.connect(self.on_pause_resume)
         self.cancel_btn.clicked.connect(self.on_cancel)
+        self.progress_updated.connect(self.update_progress)
+        self.file_sent.connect(self.on_file_sent)
+        self.log_message.connect(self.log)
     
     def start_transfer(self, total_items: int, total_size: int):
         """
@@ -221,6 +227,16 @@ class TransferPage(QWidget):
         Args:
             data: 进度数据，包含 file_path, progress, sent/total, speed
         """
+        # 检查是否是连接状态信息
+        status = data.get("status", "")
+        if status == "connected":
+            # 客户端连接通知（接收端）
+            client = data.get("client", "")
+            message = data.get("message", "")
+            self.current_file_label.setText(message)
+            self.log(f"连接建立: {client}")
+            return
+        
         file_path = data.get("file_path", "")
         progress = data.get("progress", 0)
         sent = data.get("sent", 0)
@@ -240,12 +256,28 @@ class TransferPage(QWidget):
             self.current_file_bytes = sent
             self.current_file_total = total
             
-            # 估算总体进度
+            # 计算总体进度：已完成的文件大小 + 当前文件已发送的大小
             if self.total_bytes > 0:
                 total_progress = int(
                     (self.transferred_bytes + sent) / self.total_bytes * 100
                 )
                 self.total_progress.setValue(min(total_progress, 100))
+    
+    def on_file_sent(self, file_size: int, file_path: str):
+        """
+        文件发送完成
+        
+        Args:
+            file_size: 文件大小
+            file_path: 文件路径
+        """
+        self.transferred_bytes += file_size
+        self.log(f"已完成: {file_path}")
+        
+        # 更新总体进度
+        if self.total_bytes > 0:
+            total_progress = int(self.transferred_bytes / self.total_bytes * 100)
+            self.total_progress.setValue(min(total_progress, 100))
     
     def file_completed(self, file_path: str, success: bool):
         """
@@ -286,6 +318,14 @@ class TransferPage(QWidget):
         """添加日志"""
         timestamp = time.strftime("%H:%M:%S")
         self.log_text.append(f"[{timestamp}] {message}")
+        
+        # 限制最大行数
+        cursor = self.log_text.textCursor()
+        block_count = self.log_text.document().blockCount()
+        if block_count > self.max_log_lines:
+            cursor.setPosition(0)
+            cursor.movePosition(cursor.MoveOperation.NextBlock, cursor.MoveMode.KeepAnchor, block_count - self.max_log_lines)
+            cursor.removeSelectedText()
     
     def on_back(self):
         """返回按钮"""

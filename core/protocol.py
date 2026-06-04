@@ -24,6 +24,8 @@ class Command(IntEnum):
     COMPLETE = 12       # 传输完成
     CANCEL = 13         # 取消传输
     ERROR = 99          # 错误通知
+    PING = 14           # 心跳包（保活）
+    PONG = 15           # 心跳响应
 
 
 # 消息头部大小（4字节命令 + 4字节长度）

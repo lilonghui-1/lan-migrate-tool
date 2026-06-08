@@ -362,37 +362,38 @@ class MainWindow(QMainWindow):
     def _do_transfer_resume(self, items, target_dir, task_id):
         """执行恢复传输（在线程中）"""
         results = self.transfer_manager.transfer_items(items, target_dir, task_id)
-        
+
         # 使用信号在主线程中更新UI
         self.transfer_completed.emit(results)
-    
-    def on_transfer_started(self, items, task_id=""):
+
+    def on_transfer_started(self, items, target_dir="", task_id=""):
         """开始传输"""
         self.selected_items = items
-        
+        self.target_dir = target_dir
+
         # 计算总大小
         total_size = sum(item.get("size", 0) for item in items)
-        
+
         # 切换到传输页面
         self.switch_page(2)
         self.transfer_page.start_transfer(len(items), total_size)
-        
+
         # 启动传输
         self.status_bar.showMessage("正在传输数据...")
-        
+
         # 在新线程中执行传输
         import threading
         thread = threading.Thread(
             target=self._do_transfer,
-            args=(items, task_id),
+            args=(items, target_dir, task_id),
             daemon=True
         )
         thread.start()
-    
-    def _do_transfer(self, items, task_id=""):
+
+    def _do_transfer(self, items, target_dir="", task_id=""):
         """执行传输（在线程中）"""
-        results = self.transfer_manager.transfer_items(items, resume_task_id=task_id)
-        
+        results = self.transfer_manager.transfer_items(items, target_dir, resume_task_id=task_id)
+
         # 使用信号在主线程中更新UI
         self.transfer_completed.emit(results)
     

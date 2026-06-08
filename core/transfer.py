@@ -1093,9 +1093,13 @@ class TransferManager:
                     for filename in filenames:
                         full_path = os.path.join(dirpath, filename)
                         rel_path = os.path.relpath(full_path, os.path.dirname(filepath))
+                        # 如果指定了目标目录，将目标目录作为前缀
+                        if target_dir:
+                            rel_path = os.path.join(target_dir, rel_path)
                         all_files.append({"path": full_path, "relative_path": rel_path})
             elif item_type == "file":
-                all_files.append({"path": filepath, "relative_path": ""})
+                rel_path = os.path.basename(filepath) if not target_dir else os.path.join(target_dir, os.path.basename(filepath))
+                all_files.append({"path": filepath, "relative_path": rel_path})
             elif item_type == "registry":
                 from core.registry import RegistryManager
                 reg_manager = RegistryManager()

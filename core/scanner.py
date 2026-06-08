@@ -112,6 +112,11 @@ class DataScanner:
         if registry_data.items:
             self.categories.append(registry_data)
         
+        # 扫描Windows凭据数据
+        credential_data = self.scan_windows_credentials()
+        if credential_data.items:
+            self.categories.append(credential_data)
+        
         self._scanned = True
         return self.categories
     
@@ -376,6 +381,146 @@ class DataScanner:
         category.items.append(item)
         
         return category
+    
+    def scan_windows_credentials(self) -> DataCategory:
+        """
+        扫描Windows凭据数据
+        
+        Returns:
+            凭据数据分类
+        """
+        category = DataCategory(
+            name="credentials",
+            display_name="Windows凭据",
+            description="凭据管理器、证书、WLAN配置等敏感数据"
+        )
+        
+        roaming = os.environ.get("APPDATA", "")
+        local = os.environ.get("LOCALAPPDATA", "")
+        
+        # 定义要扫描的凭据路径
+        credential_paths = [
+            {
+                "name": "UserCredentials",
+                "path": os.path.join(roaming, "Microsoft", "Credentials"),
+                "description": "用户凭据存储",
+                "selected": False
+            },
+            {
+                "name": "LocalCredentials",
+                "path": os.path.join(local, "Microsoft", "Credentials"),
+                "description": "本地凭据存储",
+                "selected": False
+            },
+            {
+                "name": "UserCertificates",
+                "path": os.path.join(roaming, "Microsoft", "SystemCertificates", "My", "Certificates"),
+                "description": "用户证书",
+                "selected": False
+            },
+            {
+                "name": "WLANProfiles",
+                "path": os.path.join(roaming, "Microsoft", "WlanSvc", "Profiles", "Interfaces"),
+                "description": "WLAN无线配置文件",
+                "selected": True
+            },
+            {
+                "name": "IEPasswords",
+                "path": os.path.join(roaming, "Microsoft", "Internet Explorer", "IntelliForms", "Storage2"),
+                "description": "IE/Edge浏览器密码",
+                "selected": False
+            }
+        ]
+        
+        # 扫描所有凭据路径
+        for cred_info in credential_paths:
+            path = cred_info["path"]
+            if not os.path.exists(path):
+                continue
+            
+            try:
+                size = self._get_folder_size_safe(path)
+                count = self._count_files_safe(path)
+                
+                if size > 0 or count > 0:
+                    item = DataItem(
+                        name=cred_info["name"],
+                        path=path,
+                        item_type="folder",
+                        size=size,
+                        count=count,
+                        description=cred_info["description"]
+                    )
+                    item.selected = cred_info["selected"]
+                    category.items.append(item)
+            except PermissionError:
+                # 跳过需要管理员权限的目录
+                continue
+            except Exception as e:
+                print(f"扫描凭据路径失败 {path}: {e}")
+                continue
+        
+        return category
+    
+    def _get_folder_size_safe(self, folder_path: str) -> int:
+        """
+        安全地计算文件夹大小（跳过无权限的文件和系统文件）
+        
+        Args:
+            folder_path: 文件夹路径
+        
+        Returns:
+            总字节数
+        """
+        total = 0
+        blacklist_dirs = ['$RECYCLE.BIN', 'System Volume Information', '$Recycle.Bin']
+        blacklist_files = ['desktop.ini', 'thumbs.db', '.DS_Store']
+        
+        try:
+            for dirpath, dirnames, filenames in os.walk(folder_path):
+                # 跳过黑名单目录
+                dirnames[:] = [d for d in dirnames if d not in blacklist_dirs]
+                
+                for f in filenames:
+                    # 跳过黑名单文件
+                    if f.lower() in [bf.lower() for bf in blacklist_files]:
+                        continue
+                    
+                    fp = os.path.join(dirpath, f)
+                    try:
+                        if os.path.exists(fp):
+                            total += os.path.getsize(fp)
+                    except (PermissionError, OSError):
+                        continue
+        except (PermissionError, OSError):
+            pass
+        return total
+    
+    def _count_files_safe(self, folder_path: str) -> int:
+        """
+        安全地计算文件数量（跳过无权限的目录和系统文件）
+        
+        Args:
+            folder_path: 文件夹路径
+        
+        Returns:
+            文件数量
+        """
+        count = 0
+        blacklist_dirs = ['$RECYCLE.BIN', 'System Volume Information', '$Recycle.Bin']
+        blacklist_files = ['desktop.ini', 'thumbs.db', '.DS_Store']
+        
+        try:
+            for dirpath, dirnames, filenames in os.walk(folder_path):
+                # 跳过黑名单目录
+                dirnames[:] = [d for d in dirnames if d not in blacklist_dirs]
+                
+                # 统计时排除黑名单文件
+                filtered_files = [f for f in filenames if f.lower() not in [bf.lower() for bf in blacklist_files]]
+                count += len(filtered_files)
+        except (PermissionError, OSError):
+            pass
+        return count
     
     def _is_process_running(self, process_names: List[str]) -> bool:
         """

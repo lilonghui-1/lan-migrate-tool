@@ -100,7 +100,16 @@ class DevicePage(QWidget):
         
         self.ip_input = QLineEdit()
         self.ip_input.setPlaceholderText("例如: 192.168.1.100")
+        self.ip_input.setMinimumWidth(150)
         manual_layout.addWidget(self.ip_input)
+        
+        manual_layout.addWidget(QLabel("端口:"))
+        
+        self.port_input = QLineEdit()
+        self.port_input.setPlaceholderText("默认9000")
+        self.port_input.setText("9000")
+        self.port_input.setMaximumWidth(80)
+        manual_layout.addWidget(self.port_input)
         
         self.manual_connect_btn = QPushButton("连接")
         self.manual_connect_btn.setStyleSheet("""
@@ -256,12 +265,26 @@ class DevicePage(QWidget):
             QMessageBox.warning(self, "提示", "请输入IP地址")
             return
         
+        # 获取端口号
+        port_text = self.port_input.text().strip()
+        if port_text:
+            try:
+                port = int(port_text)
+                if port < 1 or port > 65535:
+                    QMessageBox.warning(self, "提示", "端口号必须在1-65535之间")
+                    return
+            except ValueError:
+                QMessageBox.warning(self, "提示", "端口号必须是数字")
+                return
+        else:
+            port = 9000  # 默认端口
+        
         # 创建虚拟设备信息
         device = DeviceInfo(
-            name=f"manual_{ip}",
+            name=f"manual_{ip}:{port}",
             ip=ip,
-            port=9000,
-            device_name=f"手动输入 ({ip})",
+            port=port,
+            device_name=f"手动输入 ({ip}:{port})",
             version="unknown",
             os_name="unknown"
         )

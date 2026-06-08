@@ -40,3 +40,13 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Build and dist directories
+build_new/
+dist_new/
+
+# Debug logs
+*.log
+
+# Trae config
+.trae/

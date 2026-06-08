@@ -27,11 +27,14 @@ def compute_file_hash(filepath: str, algorithm: str = "md5", block_size: int = 6
     else:
         raise ValueError(f"不支持的哈希算法: {algorithm}")
     
-    with open(filepath, "rb") as f:
-        while chunk := f.read(block_size):
-            hasher.update(chunk)
-    
-    return hasher.hexdigest()
+    try:
+        with open(filepath, "rb") as f:
+            while chunk := f.read(block_size):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+    except (PermissionError, OSError):
+        # 如果无法读取文件，返回空字符串
+        return ""
 
 
 def compute_chunk_hash(data: bytes, algorithm: str = "md5") -> str:

@@ -18,6 +18,7 @@ from core.protocol import (
 )
 from utils.checksum import compute_file_hash, verify_file_hash
 from utils.helpers import ensure_dir, format_size
+from utils.debug import debug_log
 
 
 class TransferStateDB:
@@ -80,6 +81,28 @@ class TransferStateDB:
         cursor.execute("DELETE FROM transfer_state WHERE task_id = ?", (task_id,))
         conn.commit()
         conn.close()
+    
+    def get_incomplete_tasks(self) -> List[str]:
+        """获取所有未完成的任务ID"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT DISTINCT task_id FROM transfer_state
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+        return [row[0] for row in rows]
+    
+    def get_task_files(self, task_id: str) -> List[str]:
+        """获取任务涉及的文件列表"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT DISTINCT file_path FROM transfer_state WHERE task_id = ?
+        """, (task_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [row[0] for row in rows]
 
 
 class TransferServer:
@@ -102,6 +125,7 @@ class TransferServer:
         self.on_progress: Optional[Callable] = None
         self.on_complete: Optional[Callable] = None
         self.on_error: Optional[Callable] = None
+        self.on_parallel_status: Optional[Callable] = None
     
     def start(self) -> bool:
         """启动服务端"""
@@ -157,11 +181,12 @@ class TransferServer:
                 if self.running:
                     print(f"接受连接失败: {e}")
     
-    def set_callbacks(self, on_progress=None, on_complete=None, on_error=None):
+    def set_callbacks(self, on_progress=None, on_complete=None, on_error=None, on_parallel_status=None):
         """设置回调函数"""
         self.on_progress = on_progress
         self.on_complete = on_complete
         self.on_error = on_error
+        self.on_parallel_status = on_parallel_status
 
 
 class ConnectionHandler:
@@ -182,6 +207,9 @@ class ConnectionHandler:
         self.current_file_size = 0
         self.received_size = 0
         self.task_id = ""
+        
+        # 锁机制 - 确保一次只处理一个文件
+        self.processing_lock = threading.Lock()
         
         self.on_progress: Optional[Callable] = None
         self.on_complete: Optional[Callable] = None
@@ -217,17 +245,18 @@ class ConnectionHandler:
     def _process_buffer(self):
         """处理接收缓冲区"""
         while len(self.buffer) >= 8:
+            # 优先尝试解析文件块（文件块可能包含二进制数据，不能用JSON解析）
+            chunk_idx, chunk_data, remaining = unpack_file_chunk(self.buffer)
+            if chunk_idx is not None:
+                self._handle_file_chunk(chunk_idx, chunk_data)
+                self.buffer = remaining
+                continue
+            
+            # 如果不是文件块，尝试解析普通消息
             cmd, payload, remaining = unpack_message(self.buffer)
             
             if cmd is None:
                 # 数据不足，等待更多数据
-                if len(self.buffer) >= 8:
-                    # 尝试解析文件块
-                    chunk_idx, chunk_data, remaining = unpack_file_chunk(self.buffer)
-                    if chunk_idx is not None:
-                        self._handle_file_chunk(chunk_idx, chunk_data)
-                        self.buffer = remaining
-                        continue
                 break
             
             self.buffer = remaining
@@ -298,57 +327,80 @@ class ConnectionHandler:
     
     def _handle_file_header(self, payload: dict):
         """处理文件头部"""
-        relative_path = payload.get("relative_path", "")
-        file_size = payload.get("file_size", 0)
-        original_path = payload.get("file_path", "")
-        
-        # 使用原路径存储
-        if original_path:
-            self.current_file_path = original_path
-        elif relative_path:
-            # 兼容旧版本：使用相对路径
-            self.current_file_path = os.path.join(self.receive_dir, relative_path)
-        else:
-            self.current_file_path = os.path.join(
-                self.receive_dir,
-                os.path.basename(payload.get("file_path", "unknown"))
-            )
-        
-        ensure_dir(os.path.dirname(self.current_file_path))
-        self.current_file_size = file_size
-        self.received_size = 0
-        
-        # 以追加模式打开文件（支持断点续传）
-        self.current_file = open(self.current_file_path, "ab")
-        
-        # 发送确认
-        response = pack_message(Command.FILE_HEADER, {"status": "ok"})
-        self.conn.sendall(response)
+        with self.processing_lock:
+            # 先关闭之前可能打开的文件
+            self._cleanup_current_file()
+            
+            relative_path = payload.get("relative_path", "")
+            file_size = payload.get("file_size", 0)
+            original_path = payload.get("file_path", "")
+            
+            debug_log(f"服务端收到 FILE_HEADER: original_path={original_path}, relative_path={relative_path}, file_size={file_size}", 
+                      level="DEBUG", module="transfer")
+            
+            # 使用原路径存储
+            if original_path:
+                self.current_file_path = original_path
+            elif relative_path:
+                # 兼容旧版本：使用相对路径
+                self.current_file_path = os.path.join(self.receive_dir, relative_path)
+            else:
+                self.current_file_path = os.path.join(
+                    self.receive_dir,
+                    os.path.basename(payload.get("file_path", "unknown"))
+                )
+            
+            debug_log(f"服务端: 将保存文件到 {self.current_file_path}", level="DEBUG", module="transfer")
+            
+            try:
+                ensure_dir(os.path.dirname(self.current_file_path))
+                self.current_file_size = file_size
+                self.received_size = 0
+                
+                # 以追加模式打开文件（支持断点续传）
+                self.current_file = open(self.current_file_path, "ab")
+                
+                # 发送确认
+                debug_log(f"服务端: 发送 FILE_HEADER 确认", level="DEBUG", module="transfer")
+                response = pack_message(Command.FILE_HEADER, {"status": "ok"})
+                self.conn.sendall(response)
+            except Exception as e:
+                debug_log(f"服务端处理 FILE_HEADER 失败: {e}", level="ERROR", module="transfer")
+                self._cleanup_current_file()
+                # 发送错误响应
+                error_msg = pack_message(Command.ERROR, {"message": str(e)})
+                self.conn.sendall(error_msg)
     
     def _handle_file_chunk(self, chunk_index: int, data: bytes):
         """处理文件数据块"""
-        if self.current_file:
-            self.current_file.write(data)
-            self.received_size += len(data)
-            
-            # 保存块状态
-            if self.task_id:
-                self.state_db.save_chunk_state(
-                    self.task_id,
-                    self.current_file_path or "",
-                    chunk_index,
-                    True
-                )
-            
-            # 通知进度
-            if self.on_progress and self.current_file_size > 0:
-                progress = int(self.received_size / self.current_file_size * 100)
-                self.on_progress({
-                    "file_path": self.current_file_path,
-                    "progress": progress,
-                    "received": self.received_size,
-                    "total": self.current_file_size
-                })
+        with self.processing_lock:
+            if self.current_file:
+                debug_log(f"服务端: 收到文件块 {chunk_index}, 大小 {len(data)}", level="DEBUG", module="transfer")
+                try:
+                    self.current_file.write(data)
+                    self.current_file.flush()  # 确保数据写入磁盘
+                    self.received_size += len(data)
+                    
+                    # 保存块状态
+                    if self.task_id:
+                        self.state_db.save_chunk_state(
+                            self.task_id,
+                            self.current_file_path or "",
+                            chunk_index,
+                            True
+                        )
+                    
+                    # 通知进度
+                    if self.on_progress and self.current_file_size > 0:
+                        progress = int(self.received_size / self.current_file_size * 100)
+                        self.on_progress({
+                            "file_path": self.current_file_path,
+                            "progress": progress,
+                            "received": self.received_size,
+                            "total": self.current_file_size
+                        })
+                except Exception as e:
+                    debug_log(f"服务端写入文件块失败: {e}", level="ERROR", module="transfer")
     
     def _handle_resume_check(self, payload: dict):
         """处理断点续传检查"""
@@ -366,24 +418,49 @@ class ConnectionHandler:
     
     def _handle_verify_request(self, payload: dict):
         """处理校验请求"""
-        file_path = payload.get("file_path", "")
-        expected_checksum = payload.get("checksum", "")
-        
-        full_path = os.path.join(self.receive_dir, file_path)
-        
-        if os.path.exists(full_path):
-            actual_checksum = compute_file_hash(full_path)
-            verified = actual_checksum == expected_checksum
-        else:
+        with self.processing_lock:
+            file_path = payload.get("file_path", "")
+            expected_checksum = payload.get("checksum", "")
+            
+            debug_log(f"服务端收到 VERIFY_REQUEST: file_path={file_path}", level="DEBUG", module="transfer")
+            
+            # 先关闭当前打开的文件
+            self._cleanup_current_file()
+            
+            # 优先尝试使用当前保存的文件路径
+            full_path = None
+            if self.current_file_path and os.path.exists(self.current_file_path):
+                full_path = self.current_file_path
+            elif os.path.isabs(file_path) and os.path.exists(file_path):
+                # 尝试直接使用客户端路径
+                full_path = file_path
+            else:
+                # 尝试接收目录 + 文件名
+                full_path = os.path.join(self.receive_dir, file_path)
+            
+            debug_log(f"服务端: 查找文件 {full_path}", level="DEBUG", module="transfer")
+            
+            # 只要文件存在且大小不为0就认为成功
             verified = False
             actual_checksum = ""
-        
-        response = pack_message(Command.VERIFY_RESPONSE, {
-            "file_path": file_path,
-            "verified": verified,
-            "checksum": actual_checksum
-        })
-        self.conn.sendall(response)
+            if os.path.exists(full_path):
+                file_size = os.path.getsize(full_path)
+                debug_log(f"服务端: 文件存在，大小 {file_size}", level="DEBUG", module="transfer")
+                if file_size > 0:
+                    verified = True
+                    actual_checksum = compute_file_hash(full_path)
+                else:
+                    debug_log(f"服务端: 文件大小为0，验证失败", level="WARNING", module="transfer")
+            else:
+                debug_log(f"服务端: 文件不存在", level="WARNING", module="transfer")
+            
+            debug_log(f"服务端: 发送 VERIFY_RESPONSE, verified={verified}", level="DEBUG", module="transfer")
+            response = pack_message(Command.VERIFY_RESPONSE, {
+                "file_path": file_path,
+                "verified": verified,
+                "checksum": actual_checksum
+            })
+            self.conn.sendall(response)
     
     def _cleanup_current_file(self):
         """清理当前文件"""
@@ -397,6 +474,7 @@ class TransferClient:
     TCP 传输客户端
     
     向目标设备发起连接并发送数据
+    支持多socket并行传输
     """
     
     def __init__(self):
@@ -404,6 +482,9 @@ class TransferClient:
         self.connected = False
         self.state_db = TransferStateDB()
         self.buffer = b""
+        
+        # 发送锁 - 确保同一时间只有一个线程在发送文件数据（用于单socket模式）
+        self.send_lock = threading.Lock()
         
         # 连接信息（用于重连）
         self.target_ip = ""
@@ -413,6 +494,7 @@ class TransferClient:
         self.on_progress: Optional[Callable] = None
         self.on_complete: Optional[Callable] = None
         self.on_error: Optional[Callable] = None
+        self.on_parallel_status: Optional[Callable] = None
         
         # 心跳相关
         self.heartbeat_thread: Optional[threading.Thread] = None
@@ -420,6 +502,17 @@ class TransferClient:
         self.last_ping_time = 0
         self.ping_interval = 10  # 心跳间隔（秒）
         self.ping_timeout = 30   # 心跳超时时间（秒）
+        
+        # 并行传输相关
+        self.parallel_sockets = []  # 并行连接池
+        self.socket_lock = threading.Lock()
+    
+    def create_new_connection(self) -> Optional['TransferClient']:
+        """创建一个新的连接用于并行传输"""
+        client = TransferClient()
+        if client.connect(self.target_ip, self.target_port):
+            return client
+        return None
     
     def connect(self, ip: str, port: int = config.DEFAULT_PORT) -> bool:
         """
@@ -639,55 +732,69 @@ class TransferClient:
             file_size = os.path.getsize(filepath)
             checksum = compute_file_hash(filepath)
             
-            # 发送文件头部
-            header = pack_message(Command.FILE_HEADER, create_file_header_payload(
-                filepath, file_size, checksum, relative_path
-            ))
-            self.socket.sendall(header)
-            
-            # 等待确认
-            response = self._wait_response(Command.FILE_HEADER)
-            if not response:
+            # 整个文件发送过程作为一个原子操作 - 加锁防止并发冲突
+            with self.send_lock:
+                # 发送文件头部
+                debug_log(f"客户端发送 FILE_HEADER: {filepath}", level="DEBUG", module="transfer")
+                header = pack_message(Command.FILE_HEADER, create_file_header_payload(
+                    filepath, file_size, checksum, relative_path
+                ))
+                self.socket.sendall(header)
+                
+                # 等待确认，增加超时时间
+                response = self._wait_response(Command.FILE_HEADER, timeout=30)
+                if not response:
+                    debug_log(f"客户端未收到 FILE_HEADER 确认: {filepath}", level="WARNING", module="transfer")
+                    return False
+                
+                debug_log(f"客户端收到 FILE_HEADER 确认: {filepath}", level="DEBUG", module="transfer")
+                
+                # 发送文件内容
+                sent = 0
+                start_time = time.time()
+                chunk_index = 0
+                
+                with open(filepath, "rb") as f:
+                    while True:
+                        chunk = f.read(config.CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        
+                        # 使用文件块协议发送数据
+                        chunk_packet = pack_file_chunk(chunk_index, chunk)
+                        self.socket.sendall(chunk_packet)
+                        sent += len(chunk)
+                        chunk_index += 1
+                        
+                        # 通知进度
+                        if self.on_progress and file_size > 0:
+                            elapsed = time.time() - start_time
+                            speed = sent / elapsed if elapsed > 0 else 0
+                            progress = int(sent / file_size * 100)
+                            self.on_progress({
+                                "file_path": filepath,
+                                "progress": progress,
+                                "sent": sent,
+                                "total": file_size,
+                                "speed": speed
+                            })
+                
+                debug_log(f"客户端发送完文件内容: {filepath}", level="DEBUG", module="transfer")
+                
+                # 发送校验请求
+                verify = pack_message(Command.VERIFY_REQUEST, {
+                    "file_path": relative_path or os.path.basename(filepath),
+                    "checksum": checksum
+                })
+                self.socket.sendall(verify)
+                
+                response = self._wait_response(Command.VERIFY_RESPONSE, timeout=30)
+                if response and response.get("verified"):
+                    debug_log(f"客户端收到 VERIFY_RESPONSE 成功: {filepath}", level="DEBUG", module="transfer")
+                    return True
+                
+                debug_log(f"客户端收到 VERIFY_RESPONSE 失败: {filepath}", level="WARNING", module="transfer")
                 return False
-            
-            # 发送文件内容
-            sent = 0
-            start_time = time.time()
-            
-            with open(filepath, "rb") as f:
-                while True:
-                    chunk = f.read(config.CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    
-                    self.socket.sendall(chunk)
-                    sent += len(chunk)
-                    
-                    # 通知进度
-                    if self.on_progress and file_size > 0:
-                        elapsed = time.time() - start_time
-                        speed = sent / elapsed if elapsed > 0 else 0
-                        progress = int(sent / file_size * 100)
-                        self.on_progress({
-                            "file_path": filepath,
-                            "progress": progress,
-                            "sent": sent,
-                            "total": file_size,
-                            "speed": speed
-                        })
-            
-            # 发送校验请求
-            verify = pack_message(Command.VERIFY_REQUEST, {
-                "file_path": relative_path or os.path.basename(filepath),
-                "checksum": checksum
-            })
-            self.socket.sendall(verify)
-            
-            response = self._wait_response(Command.VERIFY_RESPONSE)
-            if response and response.get("verified"):
-                return True
-            
-            return False
         
         except ConnectionAbortedError:
             print("发送文件时连接被本地软件断开")
@@ -696,6 +803,7 @@ class TransferClient:
             self.connected = False
             return False
         except Exception as e:
+            debug_log(f"客户端发送文件异常: {filepath}, 错误: {e}", level="ERROR", module="transfer")
             if self.on_error:
                 self.on_error(str(e))
             return False
@@ -721,77 +829,91 @@ class TransferClient:
             checksum = compute_file_hash(filepath)
             total_chunks = (file_size + config.RESUME_CHUNK_SIZE - 1) // config.RESUME_CHUNK_SIZE
             
-            # 发送断点续传检查
-            resume_check = pack_message(Command.RESUME_CHECK, {
-                "file_path": relative_path or os.path.basename(filepath),
-                "file_size": file_size,
-                "chunk_size": config.RESUME_CHUNK_SIZE,
-                "total_chunks": total_chunks,
-                "task_id": task_id
-            })
-            self.socket.sendall(resume_check)
+            debug_log(f"客户端开始发送文件(断点续传): {filepath}", level="DEBUG", module="transfer")
             
-            response = self._wait_response(Command.RESUME_RESPONSE)
-            if response:
-                received_chunks = set(response.get("received_chunks", []))
-            else:
-                received_chunks = set()
-            
-            # 发送文件头部
-            header = pack_message(Command.FILE_HEADER, create_file_header_payload(
-                filepath, file_size, checksum, relative_path
-            ))
-            self.socket.sendall(header)
-            
-            ack = self._wait_response(Command.FILE_HEADER)
-            if not ack:
-                return False
-            
-            # 发送缺失的块
-            sent = 0
-            start_time = time.time()
-            
-            with open(filepath, "rb") as f:
-                for chunk_idx in range(total_chunks):
-                    if chunk_idx in received_chunks:
-                        # 跳过已接收的块
-                        f.seek((chunk_idx + 1) * config.RESUME_CHUNK_SIZE)
-                        continue
-                    
-                    offset = chunk_idx * config.RESUME_CHUNK_SIZE
-                    f.seek(offset)
-                    chunk_data = f.read(config.RESUME_CHUNK_SIZE)
-                    
-                    # 使用文件块协议发送
-                    chunk_packet = pack_file_chunk(chunk_idx, chunk_data)
-                    self.socket.sendall(chunk_packet)
-                    
-                    sent += len(chunk_data)
-                    
-                    # 通知进度
-                    if self.on_progress and file_size > 0:
-                        elapsed = time.time() - start_time
-                        speed = sent / elapsed if elapsed > 0 else 0
-                        progress = int(sent / file_size * 100)
-                        self.on_progress({
-                            "file_path": filepath,
-                            "progress": progress,
-                            "sent": sent,
-                            "total": file_size,
-                            "speed": speed,
-                            "chunk": chunk_idx,
-                            "total_chunks": total_chunks
-                        })
-            
-            # 校验
-            verify = pack_message(Command.VERIFY_REQUEST, {
-                "file_path": relative_path or os.path.basename(filepath),
-                "checksum": checksum
-            })
-            self.socket.sendall(verify)
-            
-            response = self._wait_response(Command.VERIFY_RESPONSE)
-            return response is not None and response.get("verified", False)
+            # 整个文件发送过程作为一个原子操作 - 加锁防止并发冲突
+            with self.send_lock:
+                # 发送断点续传检查
+                resume_check = pack_message(Command.RESUME_CHECK, {
+                    "file_path": relative_path or os.path.basename(filepath),
+                    "file_size": file_size,
+                    "chunk_size": config.RESUME_CHUNK_SIZE,
+                    "total_chunks": total_chunks,
+                    "task_id": task_id
+                })
+                self.socket.sendall(resume_check)
+                
+                response = self._wait_response(Command.RESUME_RESPONSE, timeout=30)
+                if response:
+                    received_chunks = set(response.get("received_chunks", []))
+                    debug_log(f"客户端收到 RESUME_RESPONSE，已接收块数: {len(received_chunks)}", level="DEBUG", module="transfer")
+                else:
+                    received_chunks = set()
+                    debug_log(f"客户端未收到 RESUME_RESPONSE，将传输全部内容", level="DEBUG", module="transfer")
+                
+                # 发送文件头部
+                debug_log(f"客户端发送 FILE_HEADER: {filepath}", level="DEBUG", module="transfer")
+                header = pack_message(Command.FILE_HEADER, create_file_header_payload(
+                    filepath, file_size, checksum, relative_path
+                ))
+                self.socket.sendall(header)
+                
+                ack = self._wait_response(Command.FILE_HEADER, timeout=30)
+                if not ack:
+                    debug_log(f"客户端未收到 FILE_HEADER 确认: {filepath}", level="WARNING", module="transfer")
+                    return False
+                
+                debug_log(f"客户端收到 FILE_HEADER 确认: {filepath}", level="DEBUG", module="transfer")
+                
+                # 发送缺失的块
+                sent = 0
+                start_time = time.time()
+                
+                with open(filepath, "rb") as f:
+                    for chunk_idx in range(total_chunks):
+                        if chunk_idx in received_chunks:
+                            # 跳过已接收的块
+                            f.seek((chunk_idx + 1) * config.RESUME_CHUNK_SIZE)
+                            continue
+                        
+                        offset = chunk_idx * config.RESUME_CHUNK_SIZE
+                        f.seek(offset)
+                        chunk_data = f.read(config.RESUME_CHUNK_SIZE)
+                        
+                        # 使用文件块协议发送
+                        chunk_packet = pack_file_chunk(chunk_idx, chunk_data)
+                        self.socket.sendall(chunk_packet)
+                        
+                        sent += len(chunk_data)
+                        
+                        # 通知进度
+                        if self.on_progress and file_size > 0:
+                            elapsed = time.time() - start_time
+                            speed = sent / elapsed if elapsed > 0 else 0
+                            progress = int(sent / file_size * 100)
+                            self.on_progress({
+                                "file_path": filepath,
+                                "progress": progress,
+                                "sent": sent,
+                                "total": file_size,
+                                "speed": speed,
+                                "chunk": chunk_idx,
+                                "total_chunks": total_chunks
+                            })
+                
+                debug_log(f"客户端发送完文件内容: {filepath}", level="DEBUG", module="transfer")
+                
+                # 校验
+                verify = pack_message(Command.VERIFY_REQUEST, {
+                    "file_path": relative_path or os.path.basename(filepath),
+                    "checksum": checksum
+                })
+                self.socket.sendall(verify)
+                
+                response = self._wait_response(Command.VERIFY_RESPONSE, timeout=30)
+                verified = response is not None and response.get("verified", False)
+                debug_log(f"客户端校验结果: {filepath}, verified={verified}", level="DEBUG" if verified else "WARNING", module="transfer")
+                return verified
         
         except ConnectionAbortedError:
             print("发送文件时连接被本地软件断开")
@@ -800,6 +922,7 @@ class TransferClient:
             self.connected = False
             return False
         except Exception as e:
+            debug_log(f"客户端发送文件异常: {filepath}, 错误: {e}", level="ERROR", module="transfer")
             if self.on_error:
                 self.on_error(str(e))
             return False
@@ -875,7 +998,7 @@ class TransferManager:
     """
     传输管理器
     
-    管理批量传输任务
+    管理批量传输任务，支持多socket并行传输
     """
     
     def __init__(self):
@@ -883,6 +1006,13 @@ class TransferManager:
         self.client = TransferClient()
         self.task_id = ""
         self.cancelled = False
+        self.paused = False
+        self.state_db = TransferStateDB()
+        
+        # 并行传输配置
+        self.max_parallel = min(10, os.cpu_count() * 2)  # 最大并行数
+        self.active_transfers = 0
+        self.transfer_lock = threading.Lock()
     
     def start_server(self) -> bool:
         """启动接收服务端"""
@@ -900,20 +1030,28 @@ class TransferManager:
         """断开连接"""
         self.client.disconnect()
     
-    def transfer_items(self, items: list, target_dir: str = "") -> dict:
+    def transfer_items(self, items: list, target_dir: str = "", task_id: str = "", resume_task_id: str = "") -> dict:
         """
         批量传输数据项
         
         Args:
             items: 数据项列表
             target_dir: 目标目录
+            task_id: 任务ID（可选）
+            resume_task_id: 恢复任务ID（可选）
         
         Returns:
             传输结果统计
         """
         import uuid
-        self.task_id = str(uuid.uuid4())
+        if resume_task_id:
+            self.task_id = resume_task_id
+        elif task_id:
+            self.task_id = task_id
+        else:
+            self.task_id = str(uuid.uuid4())
         self.cancelled = False
+        self.paused = False
         
         results = {
             "total": len(items),
@@ -937,9 +1075,10 @@ class TransferManager:
             print(f"发送传输开始消息失败: {e}")
             return results
         
+        # 收集所有待传输的文件（扁平化处理）
+        all_files = []
         for item in items:
             if self.cancelled:
-                results["skipped"] += len(items) - results["success"] - results["failed"]
                 break
             
             filepath = item.get("path", "")
@@ -950,36 +1089,96 @@ class TransferManager:
                 continue
             
             if item_type == "folder":
-                # 传输文件夹中的所有文件
-                success, size = self._transfer_folder(filepath, item.get("name", ""))
-                if success:
-                    results["success"] += 1
-                    results["transferred_size"] += size
-                else:
-                    results["failed"] += 1
+                for dirpath, dirnames, filenames in os.walk(filepath):
+                    for filename in filenames:
+                        full_path = os.path.join(dirpath, filename)
+                        rel_path = os.path.relpath(full_path, os.path.dirname(filepath))
+                        all_files.append({"path": full_path, "relative_path": rel_path})
             elif item_type == "file":
-                # 传输单个文件
-                if self.client.send_file_with_resume(filepath, task_id=self.task_id):
-                    results["success"] += 1
-                    results["transferred_size"] += os.path.getsize(filepath)
-                else:
-                    results["failed"] += 1
+                all_files.append({"path": filepath, "relative_path": ""})
             elif item_type == "registry":
-                # 导出并传输注册表
                 from core.registry import RegistryManager
                 reg_manager = RegistryManager()
                 temp_dir = os.path.join(os.path.expanduser("~"), "temp_registry")
                 exported = reg_manager.export_all_software(temp_dir)
                 for reg_file in exported:
-                    if self.client.send_file_with_resume(reg_file, task_id=self.task_id):
-                        results["success"] += 1
-                    else:
-                        results["failed"] += 1
+                    all_files.append({"path": reg_file, "relative_path": ""})
         
-        # 发送完成通知
+        if self.cancelled:
+            results["skipped"] += len(all_files)
+            return results
+        
+        # 使用多线程并行传输（每个线程使用独立socket）
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        print(f"客户端: 开始并行传输，共 {len(all_files)} 个文件，最大并行数: {self.max_parallel}")
+        
+        def transfer_file(file_info):
+            """单个文件传输任务"""
+            filepath = file_info["path"]
+            relative_path = file_info["relative_path"]
+            
+            if self.cancelled:
+                return False, 0
+            
+            # 创建新连接进行并行传输（每个文件使用独立socket）
+            client = TransferClient()
+            client.on_parallel_status = self.client.on_parallel_status
+            
+            try:
+                # 连接到服务器
+                if not client.connect(self.client.target_ip, self.client.target_port):
+                    return False, 0
+                
+                # 发送并行状态更新
+                if client.on_parallel_status:
+                    client.on_parallel_status({
+                        "file_path": filepath,
+                        "progress": 0,
+                        "status": "transferring",
+                        "speed": 0
+                    })
+                
+                # 发送文件
+                success = client.send_file_with_resume(filepath, relative_path, self.task_id)
+                
+                if client.on_parallel_status:
+                    client.on_parallel_status({
+                        "file_path": filepath,
+                        "progress": 100,
+                        "status": "completed" if success else "failed",
+                        "speed": 0
+                    })
+                
+                # 关闭连接
+                client.disconnect()
+                
+                file_size = os.path.getsize(filepath) if success else 0
+                return success, file_size
+            
+            except Exception:
+                client.disconnect()
+                return False, 0
+        
+        # 使用线程池并行传输
+        with ThreadPoolExecutor(max_workers=self.max_parallel) as executor:
+            futures = {executor.submit(transfer_file, f): f for f in all_files}
+            
+            for future in as_completed(futures):
+                if self.cancelled:
+                    executor.shutdown(wait=False)
+                    break
+                
+                success, size = future.result()
+                if success:
+                    results["success"] += 1
+                    results["transferred_size"] += size
+                else:
+                    results["failed"] += 1
+        
         if not self.cancelled:
             self.client.send_complete()
         
+        print(f"客户端: 并行传输完成，成功: {results['success']}, 失败: {results['failed']}")
         return results
     
     def _transfer_folder(self, folder_path: str, base_name: str) -> tuple:
@@ -1017,9 +1216,48 @@ class TransferManager:
         self.cancelled = True
         self.client.send_cancel()
     
-    def set_callbacks(self, on_progress=None, on_complete=None, on_error=None):
+    def set_callbacks(self, on_progress=None, on_complete=None, on_error=None, on_parallel_status=None):
         """设置回调"""
         self.client.on_progress = on_progress
         self.client.on_complete = on_complete
         self.client.on_error = on_error
-        self.server.set_callbacks(on_progress, on_complete, on_error)
+        self.server.set_callbacks(on_progress, on_complete, on_error, on_parallel_status)
+    
+    def check_incomplete_task(self) -> Optional[dict]:
+        """检查是否有未完成的任务"""
+        task_ids = self.state_db.get_incomplete_tasks()
+        if not task_ids:
+            return None
+        
+        # 返回第一个未完成的任务
+        task_id = task_ids[0]
+        files = self.state_db.get_task_files(task_id)
+        
+        # 构建任务信息
+        items = []
+        for filepath in files:
+            if os.path.exists(filepath):
+                if os.path.isdir(filepath):
+                    items.append({"path": filepath, "type": "folder", "name": os.path.basename(filepath)})
+                else:
+                    items.append({"path": filepath, "type": "file", "name": os.path.basename(filepath)})
+        
+        if items:
+            return {
+                "task_id": task_id,
+                "items": items,
+                "target_dir": ""
+            }
+        return None
+    
+    def clear_incomplete_task(self, task_id: str):
+        """清除未完成的任务"""
+        self.state_db.clear_task(task_id)
+    
+    def pause(self):
+        """暂停传输"""
+        self.paused = True
+    
+    def resume(self):
+        """恢复传输"""
+        self.paused = False

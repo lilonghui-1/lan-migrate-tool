@@ -40,6 +40,9 @@ class MainWindow(QMainWindow):
         
         self.setup_ui()
         self.setup_services()
+        
+        # 检查是否有未完成的任务
+        self.check_incomplete_task()
     
     def setup_ui(self):
         """设置UI"""
@@ -134,6 +137,8 @@ class MainWindow(QMainWindow):
         self.transfer_page.transfer_finished.connect(self.on_transfer_finished)
         self.transfer_page.back_requested.connect(lambda: self.switch_page(1))
         self.transfer_page.cancel_requested.connect(self.on_transfer_cancelled)
+        self.transfer_page.pause_requested.connect(self.on_transfer_paused)
+        self.transfer_page.resume_requested.connect(self.on_transfer_resumed)
         
         self.network_page = NetworkPage()
         
@@ -242,7 +247,8 @@ class MainWindow(QMainWindow):
         self.transfer_manager.set_callbacks(
             on_progress=self.on_transfer_progress,
             on_complete=self.on_transfer_complete,
-            on_error=self.on_transfer_error
+            on_error=self.on_transfer_error,
+            on_parallel_status=self.on_parallel_status
         )
     
     def on_device_selected(self, device):
@@ -255,6 +261,12 @@ class MainWindow(QMainWindow):
         if self.transfer_manager.connect_to_device(device.ip, device.port):
             self.status_bar.showMessage(f"已连接到 {device.device_name}")
             self.switch_page(1)
+            
+            # 检查是否有待恢复的任务
+            if hasattr(self, 'pending_task_info') and self.pending_task_info:
+                # 设置到选择页面后，设置待恢复的任务
+                self.select_page.set_pending_task_info(self.pending_task_info)
+                self.pending_task_info = None
         else:
             from PyQt6.QtWidgets import QMessageBox
             QMessageBox.critical(
@@ -265,7 +277,96 @@ class MainWindow(QMainWindow):
             )
             self.status_bar.showMessage("连接失败")
     
-    def on_transfer_started(self, items):
+    def check_incomplete_task(self):
+        """检查是否有未完成的任务"""
+        task_info = self.transfer_manager.check_incomplete_task()
+        if task_info:
+            # 有未完成的任务，询问用户是否恢复
+            from PyQt6.QtWidgets import QMessageBox
+            reply = QMessageBox.question(
+                self,
+                "检测到未完成的任务",
+                "发现之前未完成的传输任务，是否要继续？\n\n"
+                "选择'是'继续传输，选择'否'删除任务。",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                # 恢复任务
+                self.resume_task(task_info)
+            else:
+                # 清除任务
+                self.transfer_manager.clear_incomplete_task(task_info["task_id"])
+    
+    def resume_task(self, task_info: dict):
+        """恢复未完成的任务"""
+        task_id = task_info["task_id"]
+        items = task_info["items"]
+        target_dir = task_info["target_dir"]
+        
+        # 询问用户是否需要先连接设备
+        from PyQt6.QtWidgets import QMessageBox
+        
+        if not self.current_device or not self.transfer_manager.client.connected:
+            reply = QMessageBox.question(
+                self,
+                "需要连接设备",
+                "需要先连接到目标设备才能继续传输。\n"
+                "是否现在去连接设备？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                # 先让用户去连接设备
+                self.status_bar.showMessage("请先连接到目标设备，然后再恢复传输")
+                # 保存任务信息到临时变量，待连接后恢复
+                self.pending_task_info = task_info
+                # 注册一个回调，等连接后恢复任务
+                # 这里暂时先不自动恢复，让用户手动操作
+                QMessageBox.information(
+                    self,
+                    "提示",
+                    "请在连接到设备后，在'选择数据'页面点击'继续上次传输'"
+                )
+                return
+            else:
+                return
+        
+        # 直接开始恢复传输
+        self._start_resume_transfer(items, target_dir, task_id)
+    
+    def _start_resume_transfer(self, items, target_dir, task_id):
+        """开始恢复传输"""
+        self.selected_items = items
+        
+        # 计算总大小
+        total_size = sum(item.get("size", 0) for item in items)
+        
+        # 切换到传输页面
+        self.switch_page(2)
+        self.transfer_page.start_transfer(len(items), total_size)
+        self.transfer_page.log("恢复上次未完成的传输...")
+        
+        # 启动传输
+        self.status_bar.showMessage("正在恢复传输...")
+        
+        # 在新线程中执行传输
+        import threading
+        thread = threading.Thread(
+            target=self._do_transfer_resume,
+            args=(items, target_dir, task_id),
+            daemon=True
+        )
+        thread.start()
+    
+    def _do_transfer_resume(self, items, target_dir, task_id):
+        """执行恢复传输（在线程中）"""
+        results = self.transfer_manager.transfer_items(items, target_dir, task_id)
+        
+        # 使用信号在主线程中更新UI
+        self.transfer_completed.emit(results)
+    
+    def on_transfer_started(self, items, task_id=""):
         """开始传输"""
         self.selected_items = items
         
@@ -283,14 +384,14 @@ class MainWindow(QMainWindow):
         import threading
         thread = threading.Thread(
             target=self._do_transfer,
-            args=(items,),
+            args=(items, task_id),
             daemon=True
         )
         thread.start()
     
-    def _do_transfer(self, items):
+    def _do_transfer(self, items, task_id=""):
         """执行传输（在线程中）"""
-        results = self.transfer_manager.transfer_items(items)
+        results = self.transfer_manager.transfer_items(items, resume_task_id=task_id)
         
         # 使用信号在主线程中更新UI
         self.transfer_completed.emit(results)
@@ -298,6 +399,11 @@ class MainWindow(QMainWindow):
     def _on_transfer_complete_internal(self, results: dict):
         """传输完成内部处理"""
         self.transfer_page.transfer_complete(results)
+    
+    def on_parallel_status(self, data: dict):
+        """并行文件状态更新"""
+        # 使用信号来安全地更新UI
+        self.transfer_page.parallel_status.emit(data)
     
     def on_transfer_progress(self, data: dict):
         """传输进度更新"""
@@ -331,6 +437,16 @@ class MainWindow(QMainWindow):
         """传输被取消"""
         self.transfer_manager.cancel()
         self.status_bar.showMessage("传输已取消")
+    
+    def on_transfer_paused(self):
+        """传输被暂停"""
+        self.transfer_manager.pause()
+        self.status_bar.showMessage("传输已暂停")
+    
+    def on_transfer_resumed(self):
+        """传输继续"""
+        self.transfer_manager.resume()
+        self.status_bar.showMessage("传输已继续")
     
     def show_help(self):
         """显示帮助"""
